@@ -1,7 +1,7 @@
 
 import axios from 'axios';
 
-const N8N_WEBHOOK_URL = 'https://n8n.enlightenedmediacollective.com/webhook/96c90609-027b-4c79-ae36-d7bd7eaa896e';
+const N8N_WEBHOOK_URL = 'https://n8n.enlightenedmediacollective.com/webhook/ad505cea-f7a4-497b-ba94-cedead6022f3';
 const MAX_RETRIES = 2;
 const RETRY_DELAY = 1000; // 1 second
 
