@@ -19,7 +19,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const lastSubmitTime = useRef(0);
-  const DEBOUNCE_DELAY = 500; // 500ms debounce
+  const DEBOUNCE_DELAY = 1000; // 1 second debounce (increased for server-side deduplication)
 
   // Auto-resize the textarea
   useEffect(() => {

@@ -35,11 +35,65 @@ export type Database = {
         }
         Relationships: []
       }
+      webhook_requests: {
+        Row: {
+          completed_at: string | null
+          created_at: string
+          error_message: string | null
+          expires_at: string
+          id: string
+          idempotency_key: string
+          message_content_hash: string
+          n8n_response: Json | null
+          request_fingerprint: string
+          session_id: string
+          status: string
+        }
+        Insert: {
+          completed_at?: string | null
+          created_at?: string
+          error_message?: string | null
+          expires_at?: string
+          id?: string
+          idempotency_key: string
+          message_content_hash: string
+          n8n_response?: Json | null
+          request_fingerprint: string
+          session_id: string
+          status?: string
+        }
+        Update: {
+          completed_at?: string | null
+          created_at?: string
+          error_message?: string | null
+          expires_at?: string
+          id?: string
+          idempotency_key?: string
+          message_content_hash?: string
+          n8n_response?: Json | null
+          request_fingerprint?: string
+          session_id?: string
+          status?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
     }
     Functions: {
+      cleanup_expired_webhook_requests: {
+        Args: Record<PropertyKey, never>
+        Returns: undefined
+      }
+      generate_request_fingerprint: {
+        Args: {
+          p_session_id: string
+          p_message_content: string
+          p_time_window_minutes?: number
+        }
+        Returns: string
+      }
       match_documents: {
         Args: { query_embedding: string; match_count?: number; filter?: Json }
         Returns: {

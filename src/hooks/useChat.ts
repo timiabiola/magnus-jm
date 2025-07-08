@@ -22,7 +22,7 @@ const useChat = (): ChatHook => {
   const isRequestInProgress = useRef(false);
   const lastRequestTime = useRef(0);
   const abortController = useRef<AbortController | null>(null);
-  const MIN_REQUEST_INTERVAL = 1000; // 1 second minimum between requests
+  const MIN_REQUEST_INTERVAL = 2000; // 2 second minimum between requests (increased for server-side deduplication)
 
   useEffect(() => {
     const savedMessages = localStorage.getItem('chat-messages');
