@@ -31,7 +31,9 @@ const executeN8NRequest = async (content: string, sessionId: string, requestId: 
     
     const queryParams = new URLSearchParams({
       UUID: sessionId,
-      message: content
+      message: content,
+      requestId: requestId, // Add requestId for n8n-side deduplication
+      idempotencyKey: requestId
     }).toString();
 
     const response = await fetch(`${N8N_WEBHOOK_URL}?${queryParams}`, {
@@ -97,7 +99,7 @@ const handler = async (req: Request): Promise<Response> => {
       .rpc('generate_request_fingerprint', {
         p_session_id: sessionId,
         p_message_content: content.trim(),
-        p_time_window_minutes: 5
+        p_time_window_seconds: 30 // Use 30 seconds instead of default 5 minutes
       });
 
     if (fingerprintError) {
@@ -122,7 +124,12 @@ const handler = async (req: Request): Promise<Response> => {
     }
 
     if (existingRequest) {
-      console.log(`[${requestId}] Duplicate request detected - status: ${existingRequest.status}`);
+      console.log(`[${requestId}] Duplicate request detected - status: ${existingRequest.status}`, {
+        fingerprint: fingerprint.substring(0, 16),
+        idempotencyKey: idempotencyKey.substring(0, 8),
+        existingRequestId: existingRequest.id,
+        timeSinceCreated: existingRequest.created_at ? Date.now() - new Date(existingRequest.created_at).getTime() : null
+      });
       
       if (existingRequest.status === 'completed') {
         console.log(`[${requestId}] Returning cached response`);
@@ -132,11 +139,27 @@ const handler = async (req: Request): Promise<Response> => {
         );
       }
       
-      if (existingRequest.status === 'processing' || existingRequest.status === 'pending') {
-        return new Response(
-          JSON.stringify({ error: 'Request already in progress', requestId: existingRequest.id }),
-          { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
+      if (existingRequest.status === 'processing') {
+        // Check if it's a stale processing request
+        const processingStartedAt = existingRequest.processing_started_at ? new Date(existingRequest.processing_started_at) : null;
+        const processingDuration = processingStartedAt ? Date.now() - processingStartedAt.getTime() : 0;
+        
+        if (processingDuration > 120000) { // 2 minutes
+          console.log(`[${requestId}] Stale processing request detected, marking as failed`);
+          await supabase
+            .from('webhook_requests')
+            .update({
+              status: 'failed',
+              error_message: 'Processing timeout - marked as failed',
+              completed_at: new Date().toISOString()
+            })
+            .eq('id', existingRequest.id);
+        } else {
+          return new Response(
+            JSON.stringify({ error: 'Request already in progress', requestId: existingRequest.id }),
+            { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
       }
       
       if (existingRequest.status === 'failed') {
@@ -155,7 +178,8 @@ const handler = async (req: Request): Promise<Response> => {
         session_id: sessionId,
         message_content_hash: fingerprint, // Using fingerprint as hash for now
         idempotency_key: idempotencyKey,
-        status: 'processing'
+        status: 'processing',
+        processing_started_at: new Date().toISOString()
       })
       .select()
       .single();
@@ -173,24 +197,29 @@ const handler = async (req: Request): Promise<Response> => {
       throw new Error('Failed to create request record');
     }
 
-    console.log(`[${requestId}] Created request record: ${newRequest.id}`);
+    console.log(`[${requestId}] Created request record: ${newRequest.id}`, {
+      fingerprint: fingerprint.substring(0, 16),
+      idempotencyKey: idempotencyKey.substring(0, 8)
+    });
 
     try {
       // Execute n8n request
       const n8nResponse = await executeN8NRequest(content, sessionId, requestId);
       
-      // Update request as completed
+      // Update request as completed - ensure this happens even if there's an error
       const { error: updateError } = await supabase
         .from('webhook_requests')
         .update({
           status: 'completed',
           completed_at: new Date().toISOString(),
-          n8n_response: n8nResponse
+          n8n_response: n8nResponse,
+          retry_count: 1 // Increment retry count
         })
         .eq('id', newRequest.id);
 
       if (updateError) {
         console.error(`[${requestId}] Error updating request as completed:`, updateError);
+        // Continue anyway - the response was successful
       }
 
       console.log(`[${requestId}] Request completed successfully`);
@@ -202,13 +231,18 @@ const handler = async (req: Request): Promise<Response> => {
     } catch (n8nError) {
       console.error(`[${requestId}] n8n request failed:`, n8nError);
       
-      // Update request as failed
+      // Always update request as failed
       const { error: updateError } = await supabase
         .from('webhook_requests')
         .update({
           status: 'failed',
           completed_at: new Date().toISOString(),
-          error_message: n8nError instanceof Error ? n8nError.message : 'Unknown error'
+          error_message: n8nError instanceof Error ? n8nError.message : 'Unknown error',
+          last_error: JSON.stringify({
+            message: n8nError instanceof Error ? n8nError.message : 'Unknown error',
+            stack: n8nError instanceof Error ? n8nError.stack : undefined,
+            timestamp: new Date().toISOString()
+          })
         })
         .eq('id', newRequest.id);
 

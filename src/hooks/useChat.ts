@@ -9,6 +9,10 @@ import { sendMessageToWebhook } from '@/services/chatService';
 // Stable session ID outside of component state
 const stableSessionId = getSessionUUID();
 
+// Track recent messages to prevent duplicates
+const recentMessages = new Map<string, number>();
+const MESSAGE_DUPLICATE_WINDOW = 5000; // 5 seconds
+
 const useChat = (): ChatHook => {
   const [state, setState] = useState<ChatState>({
     messages: [],
@@ -23,6 +27,20 @@ const useChat = (): ChatHook => {
   const lastRequestTime = useRef(0);
   const abortController = useRef<AbortController | null>(null);
   const MIN_REQUEST_INTERVAL = 2000; // 2 second minimum between requests (increased for server-side deduplication)
+
+  // Cleanup old message hashes periodically
+  useEffect(() => {
+    const cleanup = setInterval(() => {
+      const now = Date.now();
+      for (const [hash, timestamp] of recentMessages.entries()) {
+        if (now - timestamp > MESSAGE_DUPLICATE_WINDOW) {
+          recentMessages.delete(hash);
+        }
+      }
+    }, 5000);
+
+    return () => clearInterval(cleanup);
+  }, []);
 
   useEffect(() => {
     const savedMessages = localStorage.getItem('chat-messages');
@@ -50,6 +68,28 @@ const useChat = (): ChatHook => {
     
     const now = Date.now();
     
+    // Generate message hash for duplicate detection
+    const messageData = content.trim() + stableSessionId;
+    const encoder = new TextEncoder();
+    const data = encoder.encode(messageData);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const messageHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    
+    // Check if this exact message was sent recently
+    const previousTimestamp = recentMessages.get(messageHash);
+    if (previousTimestamp && (now - previousTimestamp < MESSAGE_DUPLICATE_WINDOW)) {
+      console.log('Duplicate message detected within 5 seconds, skipping', {
+        messageHash: messageHash.substring(0, 8),
+        timeSinceLast: now - previousTimestamp
+      });
+      toast({
+        description: "This message was just sent. Please wait a moment before sending the same message again.",
+        variant: "destructive"
+      });
+      return;
+    }
+    
     // Rate limiting - prevent rapid successive requests
     if (now - lastRequestTime.current < MIN_REQUEST_INTERVAL) {
       console.log('Rate limited: Request too soon after previous request');
@@ -74,6 +114,9 @@ const useChat = (): ChatHook => {
     // Create new abort controller for this request
     abortController.current = new AbortController();
     
+    // Store message hash with timestamp
+    recentMessages.set(messageHash, now);
+    
     const userMessage: ChatMessage = {
       id: generateUUID(),
       content,
@@ -93,6 +136,7 @@ const useChat = (): ChatHook => {
     }));
 
     try {
+      console.log(`Sending message with hash ${messageHash.substring(0, 8)}`);
       const data = await sendMessageToWebhook(content, stableSessionId);
       
       // Check if request was aborted
@@ -130,7 +174,11 @@ const useChat = (): ChatHook => {
       
       // Don't show errors for aborted requests or duplicates
       if (abortController.current?.signal.aborted || 
-          (error instanceof Error && error.message.includes('Duplicate request detected'))) {
+          (error instanceof Error && (error.message.includes('Duplicate request detected') || error.message.includes('Request already in progress')))) {
+        setState(prev => ({
+          ...prev,
+          loading: false
+        }));
         return;
       }
       
