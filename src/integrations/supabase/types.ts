@@ -41,10 +41,13 @@ export type Database = {
     }
     Functions: {
       match_documents: {
-        Args:
-          | Record<PropertyKey, never>
-          | { filter?: Json; match_count?: number; query_embedding?: string }
-        Returns: undefined
+        Args: { query_embedding: string; match_count?: number; filter?: Json }
+        Returns: {
+          id: number
+          content: string
+          metadata: Json
+          similarity: number
+        }[]
       }
     }
     Enums: {
