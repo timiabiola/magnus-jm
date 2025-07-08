@@ -17,16 +17,19 @@ export type Database = {
       documents: {
         Row: {
           content: string | null
+          embedding: string | null
           id: number
           metadata: Json | null
         }
         Insert: {
           content?: string | null
+          embedding?: string | null
           id?: number
           metadata?: Json | null
         }
         Update: {
           content?: string | null
+          embedding?: string | null
           id?: number
           metadata?: Json | null
         }
@@ -38,7 +41,9 @@ export type Database = {
     }
     Functions: {
       match_documents: {
-        Args: Record<PropertyKey, never>
+        Args:
+          | Record<PropertyKey, never>
+          | { filter?: Json; match_count?: number; query_embedding?: string }
         Returns: undefined
       }
     }
