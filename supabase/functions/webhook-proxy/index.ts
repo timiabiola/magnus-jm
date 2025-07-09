@@ -36,20 +36,35 @@ const executeN8NRequest = async (content: string, sessionId: string, requestId: 
       idempotencyKey: requestId
     }).toString();
 
-    const response = await fetch(`${N8N_WEBHOOK_URL}?${queryParams}`, {
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      timeout: 40000
-    });
+    // Create AbortController for timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 40000); // 40 second timeout
 
-    if (!response.ok) {
-      throw new Error(`n8n returned ${response.status}: ${await response.text()}`);
+    try {
+      const response = await fetch(`${N8N_WEBHOOK_URL}?${queryParams}`, {
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`n8n returned ${response.status}: ${await response.text()}`);
+      }
+
+      const data = await response.json();
+      console.log(`[${requestId}] n8n response received successfully`);
+      return data;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      
+      if (error.name === 'AbortError') {
+        throw new Error('Request timeout after 40 seconds');
+      }
+      throw error;
     }
-
-    const data = await response.json();
-    console.log(`[${requestId}] n8n response received successfully`);
-    return data;
   } catch (error) {
     console.error(`[${requestId}] n8n request failed (attempt ${retryCount + 1}):`, error);
     
