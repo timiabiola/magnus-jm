@@ -1,1 +1,30 @@
 project_id = "wqtgghcxrhrszdbxkwoy"
+
+[auth]
+# Security: Shorter OTP expiry (5 minutes instead of default 1 hour)
+otp_expiry = 300
+
+# Security: Enable stronger password requirements
+password_min_length = 8
+enable_password_strength_check = true
+
+# Security: Enable email confirmation
+enable_signup = true
+enable_confirmations = true
+
+# Security: Rate limiting
+rate_limit_email_sent = 60
+rate_limit_sms_sent = 60
+
+[database]
+# Ensure RLS is enforced
+enable_rls = true
+
+[api]
+# Security headers
+cors_allowed_origins = ["http://localhost:5173", "https://*.vercel.app"]
+max_rows = 1000
+
+[storage]
+# Storage security
+file_size_limit = "50MB"
