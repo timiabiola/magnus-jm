@@ -96,9 +96,14 @@ const handler = async (req: Request): Promise<Response> => {
     Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
   );
 
+  let lockAcquired = false;
+  let requestId = '';
+  let requestData: WebhookRequest | null = null;
+
   try {
-    const { content, sessionId, idempotencyKey }: WebhookRequest = await req.json();
-    const requestId = crypto.randomUUID().substring(0, 8);
+    requestData = await req.json() as WebhookRequest;
+    const { content, sessionId, idempotencyKey } = requestData;
+    requestId = crypto.randomUUID().substring(0, 8);
     
     console.log(`[${requestId}] Webhook proxy request - session: ${sessionId.substring(0, 8)}..., idempotency: ${idempotencyKey}`);
 
@@ -109,12 +114,69 @@ const handler = async (req: Request): Promise<Response> => {
       );
     }
 
-    // Generate request fingerprint
+    // LAYER 1: Try to acquire distributed lock first
+    console.log(`[${requestId}] Attempting to acquire distributed lock...`);
+    const { data: lockResult, error: lockError } = await supabase
+      .rpc('acquire_session_lock', {
+        p_session_id: sessionId,
+        p_message_content: content.trim(),
+        p_locked_by: requestId,
+        p_lock_duration_seconds: 120
+      });
+
+    if (lockError) {
+      console.error(`[${requestId}] Error acquiring lock:`, lockError);
+    } else if (!lockResult) {
+      console.log(`[${requestId}] Could not acquire lock - request already being processed`);
+      return new Response(
+        JSON.stringify({ error: 'Request already being processed by another instance', requestId: requestId }),
+        { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    } else {
+      lockAcquired = true;
+      console.log(`[${requestId}] Distributed lock acquired successfully`);
+    }
+
+    // LAYER 2: Check for recent duplicate requests (90-second lookback)
+    console.log(`[${requestId}] Checking for recent duplicate requests...`);
+    const { data: recentDuplicate, error: duplicateError } = await supabase
+      .rpc('check_recent_duplicate_request', {
+        p_session_id: sessionId,
+        p_message_content: content.trim(),
+        p_lookback_seconds: 90
+      });
+
+    if (duplicateError) {
+      console.error(`[${requestId}] Error checking for duplicates:`, duplicateError);
+    } else if (recentDuplicate && recentDuplicate.length > 0) {
+      const existing = recentDuplicate[0];
+      console.log(`[${requestId}] Recent duplicate found:`, {
+        existingId: existing.existing_id,
+        status: existing.existing_status,
+        timeSinceCreated: existing.time_since_created
+      });
+
+      if (existing.existing_status === 'completed' && existing.n8n_response) {
+        console.log(`[${requestId}] Returning cached response from recent request`);
+        return new Response(
+          JSON.stringify(existing.n8n_response),
+          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      } else if (existing.existing_status === 'processing' && existing.time_since_created < 120) {
+        console.log(`[${requestId}] Recent request still processing`);
+        return new Response(
+          JSON.stringify({ error: 'Recent identical request still processing', existingRequestId: existing.existing_id }),
+          { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+    }
+
+    // LAYER 3: Generate request fingerprint with 90-second window
     const { data: fingerprintData, error: fingerprintError } = await supabase
       .rpc('generate_request_fingerprint', {
         p_session_id: sessionId,
         p_message_content: content.trim(),
-        p_time_window_seconds: 30 // Use 30 seconds instead of default 5 minutes
+        p_time_window_seconds: 90 // Use 90 seconds (1m 30s) window
       });
 
     if (fingerprintError) {
@@ -125,7 +187,7 @@ const handler = async (req: Request): Promise<Response> => {
     const fingerprint = fingerprintData as string;
     console.log(`[${requestId}] Generated fingerprint: ${fingerprint.substring(0, 16)}...`);
 
-    // Check for existing request with same fingerprint or idempotency key
+    // LAYER 4: Check for existing request with same fingerprint or idempotency key
     const { data: existingRequest, error: checkError } = await supabase
       .from('webhook_requests')
       .select('*')
@@ -139,7 +201,7 @@ const handler = async (req: Request): Promise<Response> => {
     }
 
     if (existingRequest) {
-      console.log(`[${requestId}] Duplicate request detected - status: ${existingRequest.status}`, {
+      console.log(`[${requestId}] Fingerprint/idempotency duplicate detected - status: ${existingRequest.status}`, {
         fingerprint: fingerprint.substring(0, 16),
         idempotencyKey: idempotencyKey.substring(0, 8),
         existingRequestId: existingRequest.id,
@@ -185,13 +247,17 @@ const handler = async (req: Request): Promise<Response> => {
       }
     }
 
-    // Create new request record
+    // Create new request record with content hash
+    const contentHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(content.trim()));
+    const contentHashHex = Array.from(new Uint8Array(contentHash)).map(b => b.toString(16).padStart(2, '0')).join('');
+
     const { data: newRequest, error: insertError } = await supabase
       .from('webhook_requests')
       .insert({
         request_fingerprint: fingerprint,
         session_id: sessionId,
-        message_content_hash: fingerprint, // Using fingerprint as hash for now
+        message_content_hash: fingerprint, // Keep for backward compatibility
+        content_hash: contentHashHex, // New proper content hash
         idempotency_key: idempotencyKey,
         status: 'processing',
         processing_started_at: new Date().toISOString()
@@ -214,7 +280,8 @@ const handler = async (req: Request): Promise<Response> => {
 
     console.log(`[${requestId}] Created request record: ${newRequest.id}`, {
       fingerprint: fingerprint.substring(0, 16),
-      idempotencyKey: idempotencyKey.substring(0, 8)
+      idempotencyKey: idempotencyKey.substring(0, 8),
+      contentHash: contentHashHex.substring(0, 16)
     });
 
     try {
@@ -279,6 +346,20 @@ const handler = async (req: Request): Promise<Response> => {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       }
     );
+  } finally {
+    // Always release the distributed lock
+    if (lockAcquired && requestId && requestData) {
+      try {
+        await supabase.rpc('release_session_lock', {
+          p_session_id: requestData.sessionId,
+          p_message_content: requestData.content.trim(),
+          p_locked_by: requestId
+        });
+        console.log(`[${requestId}] Distributed lock released`);
+      } catch (lockReleaseError) {
+        console.error(`[${requestId}] Error releasing lock:`, lockReleaseError);
+      }
+    }
   }
 };
 

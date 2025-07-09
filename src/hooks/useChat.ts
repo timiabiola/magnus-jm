@@ -11,7 +11,7 @@ const stableSessionId = getSessionUUID();
 
 // Track recent messages to prevent duplicates
 const recentMessages = new Map<string, number>();
-const MESSAGE_DUPLICATE_WINDOW = 5000; // 5 seconds
+const MESSAGE_DUPLICATE_WINDOW = 90000; // 90 seconds to match backend
 
 const useChat = (): ChatHook => {
   const [state, setState] = useState<ChatState>({
@@ -79,7 +79,7 @@ const useChat = (): ChatHook => {
     // Check if this exact message was sent recently
     const previousTimestamp = recentMessages.get(messageHash);
     if (previousTimestamp && (now - previousTimestamp < MESSAGE_DUPLICATE_WINDOW)) {
-      console.log('Duplicate message detected within 5 seconds, skipping', {
+      console.log('Duplicate message detected within 90 seconds, skipping', {
         messageHash: messageHash.substring(0, 8),
         timeSinceLast: now - previousTimestamp
       });
