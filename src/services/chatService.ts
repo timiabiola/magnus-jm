@@ -23,7 +23,7 @@ export const sendMessageToWebhook = async (content: string, sessionId: string): 
   console.log(`[${requestId}] Initiating webhook request via proxy - session: ${sessionId.substring(0, 8)}..., deterministic idempotency: ${idempotencyKey.substring(0, 8)}...`);
   
   try {
-    const { data, error } = await supabase.functions.invoke('webhook-proxy', {
+    const { data, error } = await supabase.functions.invoke('webhook-proxy-minimal', {
       body: {
         content: content.trim(),
         sessionId,
