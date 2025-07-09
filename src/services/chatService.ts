@@ -1,14 +1,26 @@
 
 import { supabase } from '@/integrations/supabase/client';
 
-// Generate unique idempotency key for each request
-const generateIdempotencyKey = () => crypto.randomUUID();
+// Generate deterministic idempotency key based on content + session + time bucket
+const generateIdempotencyKey = async (content: string, sessionId: string): Promise<string> => {
+  // Create deterministic key from content + session + 90-minute bucket
+  // This ensures same content in same session within 90 minutes gets same key
+  const timeBucket = Math.floor(Date.now() / (1000 * 60 * 90)); // 90-minute buckets
+  const keyData = `${sessionId}|${content.trim()}|${timeBucket}`;
+  
+  // Generate SHA-256 hash for deterministic idempotency key
+  const encoder = new TextEncoder();
+  const data = encoder.encode(keyData);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+};
 
 export const sendMessageToWebhook = async (content: string, sessionId: string): Promise<any> => {
-  const idempotencyKey = generateIdempotencyKey();
+  const idempotencyKey = await generateIdempotencyKey(content, sessionId);
   const requestId = idempotencyKey.substring(0, 8);
   
-  console.log(`[${requestId}] Initiating webhook request via proxy - session: ${sessionId.substring(0, 8)}...`);
+  console.log(`[${requestId}] Initiating webhook request via proxy - session: ${sessionId.substring(0, 8)}..., deterministic idempotency: ${idempotencyKey.substring(0, 8)}...`);
   
   try {
     const { data, error } = await supabase.functions.invoke('webhook-proxy', {

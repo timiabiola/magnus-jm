@@ -11,7 +11,7 @@ const stableSessionId = getSessionUUID();
 
 // Track recent messages to prevent duplicates
 const recentMessages = new Map<string, number>();
-const MESSAGE_DUPLICATE_WINDOW = 90000; // 90 seconds to match backend
+const MESSAGE_DUPLICATE_WINDOW = 90 * 60 * 1000; // 90 minutes to match backend
 
 const useChat = (): ChatHook => {
   const [state, setState] = useState<ChatState>({
@@ -68,10 +68,11 @@ const useChat = (): ChatHook => {
     
     const now = Date.now();
     
-    // Generate message hash for duplicate detection
-    const messageData = content.trim() + stableSessionId;
+    // Generate deterministic message hash that matches backend idempotency key generation
+    const timeBucket = Math.floor(Date.now() / (1000 * 60 * 90)); // 90-minute buckets
+    const keyData = `${stableSessionId}|${content.trim()}|${timeBucket}`;
     const encoder = new TextEncoder();
-    const data = encoder.encode(messageData);
+    const data = encoder.encode(keyData);
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     const messageHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
@@ -79,12 +80,12 @@ const useChat = (): ChatHook => {
     // Check if this exact message was sent recently
     const previousTimestamp = recentMessages.get(messageHash);
     if (previousTimestamp && (now - previousTimestamp < MESSAGE_DUPLICATE_WINDOW)) {
-      console.log('Duplicate message detected within 90 seconds, skipping', {
+      console.log('Duplicate message detected within 90 minutes, skipping', {
         messageHash: messageHash.substring(0, 8),
         timeSinceLast: now - previousTimestamp
       });
       toast({
-        description: "This message was just sent. Please wait a moment before sending the same message again.",
+        description: "This message was recently sent. Please wait before sending the same message again.",
         variant: "destructive"
       });
       return;

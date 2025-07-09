@@ -96,14 +96,9 @@ const handler = async (req: Request): Promise<Response> => {
     Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
   );
 
-  let lockAcquired = false;
-  let requestId = '';
-  let requestData: WebhookRequest | null = null;
-
   try {
-    requestData = await req.json() as WebhookRequest;
-    const { content, sessionId, idempotencyKey } = requestData;
-    requestId = crypto.randomUUID().substring(0, 8);
+    const { content, sessionId, idempotencyKey }: WebhookRequest = await req.json();
+    const requestId = crypto.randomUUID().substring(0, 8);
     
     console.log(`[${requestId}] Webhook proxy request - session: ${sessionId.substring(0, 8)}..., idempotency: ${idempotencyKey}`);
 
@@ -114,151 +109,51 @@ const handler = async (req: Request): Promise<Response> => {
       );
     }
 
-    // LAYER 1: Try to acquire distributed lock first
-    console.log(`[${requestId}] Attempting to acquire distributed lock...`);
-    const { data: lockResult, error: lockError } = await supabase
-      .rpc('acquire_session_lock', {
-        p_session_id: sessionId,
-        p_message_content: content.trim(),
-        p_locked_by: requestId,
-        p_lock_duration_seconds: 120
-      });
+    console.log(`[${requestId}] Processing request - idempotency: ${idempotencyKey.substring(0, 8)}...`);
 
-    if (lockError) {
-      console.error(`[${requestId}] Error acquiring lock:`, lockError);
-    } else if (!lockResult) {
-      console.log(`[${requestId}] Could not acquire lock - request already being processed`);
-      return new Response(
-        JSON.stringify({ error: 'Request already being processed by another instance', requestId: requestId }),
-        { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
-    } else {
-      lockAcquired = true;
-      console.log(`[${requestId}] Distributed lock acquired successfully`);
-    }
-
-    // LAYER 2: Check for recent duplicate requests (90-second lookback)
-    console.log(`[${requestId}] Checking for recent duplicate requests...`);
-    const { data: recentDuplicate, error: duplicateError } = await supabase
-      .rpc('check_recent_duplicate_request', {
-        p_session_id: sessionId,
-        p_message_content: content.trim(),
-        p_lookback_seconds: 90
-      });
-
-    if (duplicateError) {
-      console.error(`[${requestId}] Error checking for duplicates:`, duplicateError);
-    } else if (recentDuplicate && recentDuplicate.length > 0) {
-      const existing = recentDuplicate[0];
-      console.log(`[${requestId}] Recent duplicate found:`, {
-        existingId: existing.existing_id,
-        status: existing.existing_status,
-        timeSinceCreated: existing.time_since_created
-      });
-
-      if (existing.existing_status === 'completed' && existing.n8n_response) {
-        console.log(`[${requestId}] Returning cached response from recent request`);
-        return new Response(
-          JSON.stringify(existing.n8n_response),
-          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      } else if (existing.existing_status === 'processing' && existing.time_since_created < 120) {
-        console.log(`[${requestId}] Recent request still processing`);
-        return new Response(
-          JSON.stringify({ error: 'Recent identical request still processing', existingRequestId: existing.existing_id }),
-          { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
-      }
-    }
-
-    // LAYER 3: Generate request fingerprint with 90-second window
-    const { data: fingerprintData, error: fingerprintError } = await supabase
-      .rpc('generate_request_fingerprint', {
-        p_session_id: sessionId,
-        p_message_content: content.trim(),
-        p_time_window_seconds: 90 // Use 90 seconds (1m 30s) window
-      });
-
-    if (fingerprintError) {
-      console.error(`[${requestId}] Error generating fingerprint:`, fingerprintError);
-      throw new Error('Failed to generate request fingerprint');
-    }
-
-    const fingerprint = fingerprintData as string;
-    console.log(`[${requestId}] Generated fingerprint: ${fingerprint.substring(0, 16)}...`);
-
-    // LAYER 4: Check for existing request with same fingerprint or idempotency key
+    // BULLETPROOF SINGLE LAYER: Check if this exact idempotency key was processed recently
     const { data: existingRequest, error: checkError } = await supabase
       .from('webhook_requests')
       .select('*')
-      .or(`request_fingerprint.eq.${fingerprint},idempotency_key.eq.${idempotencyKey}`)
-      .gte('expires_at', new Date().toISOString())
+      .eq('idempotency_key', idempotencyKey)
+      .gte('created_at', new Date(Date.now() - 90 * 60 * 1000).toISOString()) // 90 minutes
+      .order('created_at', { ascending: false })
+      .limit(1)
       .single();
 
-    if (checkError && checkError.code !== 'PGRST116') { // PGRST116 = no rows found
-      console.error(`[${requestId}] Error checking existing requests:`, checkError);
-      throw new Error('Failed to check for duplicate requests');
-    }
-
-    if (existingRequest) {
-      console.log(`[${requestId}] Fingerprint/idempotency duplicate detected - status: ${existingRequest.status}`, {
-        fingerprint: fingerprint.substring(0, 16),
-        idempotencyKey: idempotencyKey.substring(0, 8),
-        existingRequestId: existingRequest.id,
-        timeSinceCreated: existingRequest.created_at ? Date.now() - new Date(existingRequest.created_at).getTime() : null
+    if (!checkError && existingRequest) {
+      console.log(`[${requestId}] Duplicate idempotency key found:`, {
+        existingId: existingRequest.id,
+        status: existingRequest.status,
+        createdAt: existingRequest.created_at
       });
       
-      if (existingRequest.status === 'completed') {
-        console.log(`[${requestId}] Returning cached response`);
-        return new Response(
-          JSON.stringify(existingRequest.n8n_response),
-          { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
+      // Return cached response if completed
+      if (existingRequest.status === 'completed' && existingRequest.n8n_response) {
+        return new Response(JSON.stringify(existingRequest.n8n_response), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
       }
-      
-      if (existingRequest.status === 'processing') {
-        // Check if it's a stale processing request
-        const processingStartedAt = existingRequest.processing_started_at ? new Date(existingRequest.processing_started_at) : null;
-        const processingDuration = processingStartedAt ? Date.now() - processingStartedAt.getTime() : 0;
-        
-        if (processingDuration > 120000) { // 2 minutes
-          console.log(`[${requestId}] Stale processing request detected, marking as failed`);
-          await supabase
-            .from('webhook_requests')
-            .update({
-              status: 'failed',
-              error_message: 'Processing timeout - marked as failed',
-              completed_at: new Date().toISOString()
-            })
-            .eq('id', existingRequest.id);
-        } else {
-          return new Response(
-            JSON.stringify({ error: 'Request already in progress', requestId: existingRequest.id }),
-            { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-          );
-        }
-      }
-      
-      if (existingRequest.status === 'failed') {
-        return new Response(
-          JSON.stringify({ error: existingRequest.error_message || 'Previous request failed' }),
-          { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
+
+      // Block if still processing (within 2 minutes)
+      const timeSinceCreated = Date.now() - new Date(existingRequest.created_at).getTime();
+      if (existingRequest.status === 'processing' && timeSinceCreated < 120000) {
+        return new Response(JSON.stringify({ 
+          error: 'Request with same idempotency key already processing' 
+        }), {
+          status: 409,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
       }
     }
 
-    // Create new request record with content hash
-    const contentHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(content.trim()));
-    const contentHashHex = Array.from(new Uint8Array(contentHash)).map(b => b.toString(16).padStart(2, '0')).join('');
-
+    // Create new request record
     const { data: newRequest, error: insertError } = await supabase
       .from('webhook_requests')
       .insert({
-        request_fingerprint: fingerprint,
-        session_id: sessionId,
-        message_content_hash: fingerprint, // Keep for backward compatibility
-        content_hash: contentHashHex, // New proper content hash
         idempotency_key: idempotencyKey,
+        session_id: sessionId,
+        message_content_hash: idempotencyKey, // Use idempotency key as hash
         status: 'processing',
         processing_started_at: new Date().toISOString()
       })
@@ -268,47 +163,35 @@ const handler = async (req: Request): Promise<Response> => {
     if (insertError) {
       console.error(`[${requestId}] Error creating request record:`, insertError);
       
-      if (insertError.code === '23505') { // Unique constraint violation
-        return new Response(
-          JSON.stringify({ error: 'Duplicate request detected' }),
-          { status: 409, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-        );
+      // If unique constraint violation, return duplicate error
+      if (insertError.code === '23505') {
+        return new Response(JSON.stringify({ error: 'Duplicate request' }), {
+          status: 409,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
       }
-      
       throw new Error('Failed to create request record');
     }
 
-    console.log(`[${requestId}] Created request record: ${newRequest.id}`, {
-      fingerprint: fingerprint.substring(0, 16),
-      idempotencyKey: idempotencyKey.substring(0, 8),
-      contentHash: contentHashHex.substring(0, 16)
-    });
+    console.log(`[${requestId}] Created request record: ${newRequest.id}`);
 
     try {
       // Execute n8n request
       const n8nResponse = await executeN8NRequest(content, sessionId, requestId);
       
-      // Update request as completed - ensure this happens even if there's an error
-      const { error: updateError } = await supabase
+      // Update as completed
+      await supabase
         .from('webhook_requests')
         .update({
           status: 'completed',
           completed_at: new Date().toISOString(),
-          n8n_response: n8nResponse,
-          retry_count: 1 // Increment retry count
+          n8n_response: n8nResponse
         })
         .eq('id', newRequest.id);
 
-      if (updateError) {
-        console.error(`[${requestId}] Error updating request as completed:`, updateError);
-        // Continue anyway - the response was successful
-      }
-
-      console.log(`[${requestId}] Request completed successfully`);
-      return new Response(
-        JSON.stringify(n8nResponse),
-        { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
-      );
+      return new Response(JSON.stringify(n8nResponse), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
 
     } catch (n8nError) {
       console.error(`[${requestId}] n8n request failed:`, n8nError);
@@ -346,20 +229,6 @@ const handler = async (req: Request): Promise<Response> => {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
       }
     );
-  } finally {
-    // Always release the distributed lock
-    if (lockAcquired && requestId && requestData) {
-      try {
-        await supabase.rpc('release_session_lock', {
-          p_session_id: requestData.sessionId,
-          p_message_content: requestData.content.trim(),
-          p_locked_by: requestId
-        });
-        console.log(`[${requestId}] Distributed lock released`);
-      } catch (lockReleaseError) {
-        console.error(`[${requestId}] Error releasing lock:`, lockReleaseError);
-      }
-    }
   }
 };
 
